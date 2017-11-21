@@ -1,8 +1,6 @@
 {
   "ssl_certificate" : "xxxxx-signed-cert.pem",
   "private_key" : "xxxxx_privkey.key",
-  "discoveryURI" : "https://accounts.open-to-all.com/auth/realms/OpenToAll/.well-known/openid-configuration",
-  "clientID": "emission-mobile-dev",
   "moves" : {
     "client_id": "Get from https://dev.moves-app.com",
     "client_secret": "Get from https://dev.moves-app.com",

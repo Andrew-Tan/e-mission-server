@@ -6,6 +6,7 @@ import bottle as bt
 # To support dynamic loading of client-specific libraries
 import sys
 import os
+import logging
 import logging.config
 
 from datetime import datetime
@@ -47,8 +48,6 @@ import emission.storage.timeseries.cache_series as esdc
 import emission.core.timer as ect
 import emission.core.get_database as edb
 
-from emission.net.api.validateToken import OpenIDTokenValidator
-
 config_file = open('conf/net/api/webserver.conf')
 config_data = json.load(config_file)
 static_path = config_data["paths"]["static_path"]
@@ -60,14 +59,17 @@ log_base_dir = config_data["paths"]["log_base_dir"]
 
 key_file = open('conf/net/keys.json')
 key_data = json.load(key_file)
-discoveryURI = key_data["discoveryURI"]
-clientID = key_data["clientID"]
+ssl_cert = key_data["ssl_certificate"]
+private_key = key_data["private_key"]
+client_key = key_data["client_key"]
+client_key_old = key_data["client_key_old"]
+ios_client_key = key_data["ios_client_key"]
+ios_client_key_new = key_data["ios_client_key_new"]
 
 BaseRequest.MEMFILE_MAX = 1024 * 1024 * 1024 # Allow the request size to be 1G
 # to accomodate large section sizes
 
 skipAuth = False
-tokenValidator = OpenIDTokenValidator(discoveryURI, clientID)
 print "Finished configuring logging for %s" % logging.getLogger()
 app = app()
 
@@ -652,7 +654,7 @@ def habiticaRegister():
   # regenerating the password if we already have the user
   autogen_id = requests.get("http://www.dinopass.com/password/simple").text
   logging.debug("generated id %s through dinopass" % autogen_id)
-  autogen_email = "%s@save.world" % autogen_idf
+  autogen_email = "%s@save.world" % autogen_id
   autogen_password = autogen_id
   return habitproxy.habiticaRegister(username, autogen_email,
                               autogen_password, user_uuid)
@@ -668,17 +670,6 @@ def habiticaProxy():
     return habitproxy.habiticaProxy(user_uuid, method, method_url,
                                     method_args)
 # Data source integration END
-
-# Survey integration START
-@get('/survey')
-def saveSurvey():
-    logging.debug("Survey saving request %s" % (request))
-    # user_uuid = getUUID(request)
-    # assert (user_uuid is not None)
-
-    return {'status': 'ok', 'test': 'Hello World!'}
-# Survey integration END
-
 
 @app.hook('before_request')
 def before_request():
@@ -711,7 +702,39 @@ def after_request():
 # This should only be used by createUserProfile since we may not have a UUID
 # yet. All others should use the UUID.
 def verifyUserToken(token):
-    tokenFields = tokenValidator.verify_and_decode_token(token)
+    try:
+        # attempt to validate token on the client-side
+        logging.debug("Using OAuth2Client to verify id token of length %d from android phones" % len(token))
+        tokenFields = oauth2client.client.verify_id_token(token,client_key)
+        logging.debug(tokenFields)
+    except AppIdentityError as androidExp:
+        try:
+            logging.debug("Using OAuth2Client to verify id token of length %d from android phones using old token" % len(token))
+            tokenFields = oauth2client.client.verify_id_token(token,client_key_old)
+            logging.debug(tokenFields)
+        except AppIdentityError as androidExpOld:
+            try:
+                logging.debug("Using OAuth2Client to verify id token from iOS phones")
+                tokenFields = oauth2client.client.verify_id_token(token, ios_client_key)
+                logging.debug(tokenFields)
+            except AppIdentityError as iOSExp:
+                try:
+                    logging.debug("Using OAuth2Client to verify id token from newer iOS phones")
+                    tokenFields = oauth2client.client.verify_id_token(token, ios_client_key_new)
+                    logging.debug(tokenFields)
+                except AppIdentityError as iOSExp:
+                    traceback.print_exc()
+                    logging.debug("OAuth failed to verify id token, falling back to constructedURL")
+                    #fallback to verifying using Google API
+                    constructedURL = ("https://www.googleapis.com/oauth2/v1/tokeninfo?id_token=%s" % token)
+                    r = requests.get(constructedURL)
+                    tokenFields = json.loads(r.content)
+                    in_client_key = tokenFields['audience']
+                    if (in_client_key != client_key):
+                        if (in_client_key != ios_client_key and 
+                            in_client_key != ios_client_key_new):
+                            abort(401, "Invalid client key %s" % in_client_key)
+    logging.debug("Found user email %s" % tokenFields['email'])
     return tokenFields['email']
 
 def getUUIDFromToken(token):
@@ -795,8 +818,8 @@ if __name__ == '__main__':
       # running on localhost but still want to run without authentication. That is
       # not really an important use case now, and it makes people have to change
       # two values and increases the chance of bugs. So let's key the auth skipping from this as well.
-      # skipAuth = True
-      # print "Running with HTTPS turned OFF, skipAuth = True"
+      skipAuth = True
+      print "Running with HTTPS turned OFF, skipAuth = True"
 
       run(host=server_host, port=server_port, server='cherrypy', debug=True)
 
