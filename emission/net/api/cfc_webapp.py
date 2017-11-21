@@ -6,6 +6,7 @@ import bottle as bt
 # To support dynamic loading of client-specific libraries
 import sys
 import os
+import logging
 import logging.config
 
 from datetime import datetime
@@ -17,9 +18,6 @@ import socket
 # For decoding JWTs using the google decode URL
 import urllib
 import requests
-# For decoding JWTs on the client side
-import oauth2client.client
-from oauth2client.crypt import AppIdentityError
 import traceback
 import xmltodict
 import urllib2
@@ -29,6 +27,7 @@ import bson.json_util
 import modeshare, zipcode, distance, tripManager, \
                  Berkeley, visualize, stats, usercache, timeline, \
                  metrics, pipeline
+import emission.net.auth.auth as enaa
 import emission.net.ext_service.moves.register as auth
 import emission.net.ext_service.habitica.proxy as habitproxy
 import emission.analysis.result.carbon as carbon
@@ -47,8 +46,6 @@ import emission.storage.timeseries.cache_series as esdc
 import emission.core.timer as ect
 import emission.core.get_database as edb
 
-from emission.net.api.validateToken import OpenIDTokenValidator
-
 config_file = open('conf/net/api/webserver.conf')
 config_data = json.load(config_file)
 static_path = config_data["paths"]["static_path"]
@@ -57,17 +54,17 @@ server_host = config_data["server"]["host"]
 server_port = config_data["server"]["port"]
 socket_timeout = config_data["server"]["timeout"]
 log_base_dir = config_data["paths"]["log_base_dir"]
+auth_method = config_data["server"]["auth"]
 
 key_file = open('conf/net/keys.json')
 key_data = json.load(key_file)
-discoveryURI = key_data["discoveryURI"]
-clientID = key_data["clientID"]
+ssl_cert = key_data["ssl_certificate"]
+private_key = key_data["private_key"]
 
 BaseRequest.MEMFILE_MAX = 1024 * 1024 * 1024 # Allow the request size to be 1G
 # to accomodate large section sizes
 
 skipAuth = False
-tokenValidator = OpenIDTokenValidator(discoveryURI, clientID)
 print "Finished configuring logging for %s" % logging.getLogger()
 app = app()
 
@@ -89,6 +86,7 @@ def index():
 @route("/docs/<filename>")
 def docs(filename):
   if filename != "privacy.html" and filename != "support.html" and filename != "about.html" and filename != "consent.html" and filename != "approval_letter.pdf":
+    logging.error("Request for unknown filename "% filename)
     logging.error("Request for unknown filename "% filename)
     return HTTPError(404, "Don't try to hack me, you evil spammer")
   else:
@@ -382,19 +380,17 @@ def getTrips(day):
 
 @post('/profile/create')
 def createUserProfile():
-  logging.debug("Called createUserProfile")
-  userToken = request.json['user']
-  # This is the only place we should use the email, since we may not have a
-  # UUID yet. All others should only use the UUID.
-  if skipAuth:
-    userEmail = userToken
-  else:
-    userEmail = verifyUserToken(userToken)
-  logging.debug("userEmail = %s" % userEmail)
-  user = User.register(userEmail)
-  logging.debug("Looked up user = %s" % user)
-  logging.debug("Returning result %s" % {'uuid': str(user.uuid)})
-  return {'uuid': str(user.uuid)}
+  try:
+      logging.debug("Called createUserProfile")
+      userEmail = enaa.__getEmail(request, skipAuth, auth_method)
+      logging.debug("userEmail = %s" % userEmail)
+      user = User.register(userEmail)
+      logging.debug("Looked up user = %s" % user)
+      logging.debug("Returning result %s" % {'uuid': str(user.uuid)})
+      return {'uuid': str(user.uuid)}
+  except ValueError, e:
+      traceback.print_exc()
+      abort(403, e.message)
 
 @post('/profile/update')
 def updateUserProfile():
@@ -652,7 +648,7 @@ def habiticaRegister():
   # regenerating the password if we already have the user
   autogen_id = requests.get("http://www.dinopass.com/password/simple").text
   logging.debug("generated id %s through dinopass" % autogen_id)
-  autogen_email = "%s@save.world" % autogen_idf
+  autogen_email = "%s@save.world" % autogen_id
   autogen_password = autogen_id
   return habitproxy.habiticaRegister(username, autogen_email,
                               autogen_password, user_uuid)
@@ -668,17 +664,6 @@ def habiticaProxy():
     return habitproxy.habiticaProxy(user_uuid, method, method_url,
                                     method_args)
 # Data source integration END
-
-# Survey integration START
-@get('/survey')
-def saveSurvey():
-    logging.debug("Survey saving request %s" % (request))
-    # user_uuid = getUUID(request)
-    # assert (user_uuid is not None)
-
-    return {'status': 'ok', 'test': 'Hello World!'}
-# Survey integration END
-
 
 @app.hook('before_request')
 def before_request():
@@ -710,54 +695,18 @@ def after_request():
 # Auth helpers BEGIN
 # This should only be used by createUserProfile since we may not have a UUID
 # yet. All others should use the UUID.
-def verifyUserToken(token):
-    tokenFields = tokenValidator.verify_and_decode_token(token)
-    return tokenFields['email']
-
-def getUUIDFromToken(token):
-    userEmail = verifyUserToken(token)
-    return __getUUIDFromEmail__(userEmail)
-
-# This should not be used for general API calls
-def __getUUIDFromEmail__(userEmail):
-    user=User.fromEmail(userEmail)
-    if user is None:
-        return None
-    user_uuid=user.uuid
-    return user_uuid
-
-def __getToken__(request, inHeader):
-    if inHeader:
-      userHeaderSplitList = request.headers.get('User').split()
-      if len(userHeaderSplitList) == 1:
-          userToken = userHeaderSplitList[0]
-      else:
-          userToken = userHeaderSplitList[1]
-    else:
-      userToken = request.json['user']
-
-    return userToken
 
 def getUUID(request, inHeader=False):
-  retUUID = None
-  if skipAuth:
-    if 'User' in request.headers or 'user' in request.json:
-        # skipAuth = true, so the email will be sent in plaintext
-        userEmail = __getToken__(request, inHeader)
-        retUUID = __getUUIDFromEmail__(userEmail)
-        logging.debug("skipAuth = %s, returning UUID directly from email %s" % (skipAuth, retUUID))
-    else:
-        logging.debug("skipAuth = %s, returning None")
-        return None
-    if Client("choice").getClientKey() is None:
-        Client("choice").update(createKey = True)
-  else:
-    userToken = __getToken__(request, inHeader)
-    retUUID = getUUIDFromToken(userToken)
-  if retUUID is None:
-     raise HTTPError(403, "token is valid, but no account found for user")
-  request.params.user_uuid = retUUID
-  return retUUID
+    try:
+        retUUID = enaa.getUUID(request, skipAuth, auth_method, inHeader)
+        logging.debug("retUUID = %s" % retUUID)
+        if retUUID is None:
+           raise HTTPError(403, "token is valid, but no account found for user")
+        return retUUID
+    except ValueError, e:
+        traceback.print_exc()
+        abort(401, e.message)
+
 # Auth helpers END
 
 if __name__ == '__main__':
@@ -795,8 +744,8 @@ if __name__ == '__main__':
       # running on localhost but still want to run without authentication. That is
       # not really an important use case now, and it makes people have to change
       # two values and increases the chance of bugs. So let's key the auth skipping from this as well.
-      # skipAuth = True
-      # print "Running with HTTPS turned OFF, skipAuth = True"
+      skipAuth = True
+      print "Running with HTTPS turned OFF, skipAuth = True"
 
       run(host=server_host, port=server_port, server='cherrypy', debug=True)
 
