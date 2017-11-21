@@ -18,9 +18,6 @@ import socket
 # For decoding JWTs using the google decode URL
 import urllib
 import requests
-# For decoding JWTs on the client side
-import oauth2client.client
-from oauth2client.crypt import AppIdentityError
 import traceback
 import xmltodict
 import urllib2
@@ -30,7 +27,8 @@ import bson.json_util
 import modeshare, zipcode, distance, tripManager, \
                  Berkeley, visualize, stats, usercache, timeline, \
                  metrics, pipeline
-import emission.net.ext_service.moves.register as auth
+import emission.net.auth.auth as enaa
+# import emission.net.ext_service.moves.register as auth
 import emission.net.ext_service.habitica.proxy as habitproxy
 import emission.analysis.result.carbon as carbon
 import emission.analysis.classification.inference.commute as commute
@@ -48,7 +46,12 @@ import emission.storage.timeseries.cache_series as esdc
 import emission.core.timer as ect
 import emission.core.get_database as edb
 
-config_file = open('conf/net/api/webserver.conf')
+try:
+    config_file = open('conf/net/api/webserver.conf')
+except:
+    logging.debug("webserver not configured, falling back to sample, default configuration")
+    config_file = open('conf/net/api/webserver.conf.sample')
+
 config_data = json.load(config_file)
 static_path = config_data["paths"]["static_path"]
 python_path = config_data["paths"]["python_path"]
@@ -56,20 +59,11 @@ server_host = config_data["server"]["host"]
 server_port = config_data["server"]["port"]
 socket_timeout = config_data["server"]["timeout"]
 log_base_dir = config_data["paths"]["log_base_dir"]
-
-key_file = open('conf/net/keys.json')
-key_data = json.load(key_file)
-ssl_cert = key_data["ssl_certificate"]
-private_key = key_data["private_key"]
-client_key = key_data["client_key"]
-client_key_old = key_data["client_key_old"]
-ios_client_key = key_data["ios_client_key"]
-ios_client_key_new = key_data["ios_client_key_new"]
+auth_method = config_data["server"]["auth"]
 
 BaseRequest.MEMFILE_MAX = 1024 * 1024 * 1024 # Allow the request size to be 1G
 # to accomodate large section sizes
 
-skipAuth = False
 print "Finished configuring logging for %s" % logging.getLogger()
 app = app()
 
@@ -91,6 +85,7 @@ def index():
 @route("/docs/<filename>")
 def docs(filename):
   if filename != "privacy.html" and filename != "support.html" and filename != "about.html" and filename != "consent.html" and filename != "approval_letter.pdf":
+    logging.error("Request for unknown filename "% filename)
     logging.error("Request for unknown filename "% filename)
     return HTTPError(404, "Don't try to hack me, you evil spammer")
   else:
@@ -384,19 +379,17 @@ def getTrips(day):
 
 @post('/profile/create')
 def createUserProfile():
-  logging.debug("Called createUserProfile")
-  userToken = request.json['user']
-  # This is the only place we should use the email, since we may not have a
-  # UUID yet. All others should only use the UUID.
-  if skipAuth:
-    userEmail = userToken
-  else:
-    userEmail = verifyUserToken(userToken)
-  logging.debug("userEmail = %s" % userEmail)
-  user = User.register(userEmail)
-  logging.debug("Looked up user = %s" % user)
-  logging.debug("Returning result %s" % {'uuid': str(user.uuid)})
-  return {'uuid': str(user.uuid)}
+  try:
+      logging.debug("Called createUserProfile")
+      userEmail = enaa.__getEmail(request, auth_method)
+      logging.debug("userEmail = %s" % userEmail)
+      user = User.register(userEmail)
+      logging.debug("Looked up user = %s" % user)
+      logging.debug("Returning result %s" % {'uuid': str(user.uuid)})
+      return {'uuid': str(user.uuid)}
+  except ValueError, e:
+      traceback.print_exc()
+      abort(403, e.message)
 
 @post('/profile/update')
 def updateUserProfile():
@@ -439,12 +432,12 @@ def postCarbonCompare():
   from clients.data import data
   from clients.choice import choice
 
-  if not skipAuth:
-      if request.json == None:
-        return "Waiting for user data to become available..."
-      if 'user' not in request.json:
-        return "Waiting for user data to be become available.."
-
+#   if not skipAuth:
+#       if request.json == None:
+#         return "Waiting for user data to become available..."
+#       if 'user' not in request.json:
+#         return "Waiting for user data to be become available.."
+#
   user_uuid = getUUID(request)
 
   clientResult = userclient.getClientSpecificResult(user_uuid)
@@ -462,10 +455,10 @@ def getCarbonCompare():
 
   from clients.data import data
 
-  if not skipAuth:
-    if 'User' not in request.headers or request.headers.get('User') == '':
-        return "Waiting for user data to become available..."
-
+#   if not skipAuth:
+#     if 'User' not in request.headers or request.headers.get('User') == '':
+#         return "Waiting for user data to become available..."
+#
   from clients.choice import choice
 
   user_uuid = getUUID(request, inHeader=True)
@@ -701,86 +694,18 @@ def after_request():
 # Auth helpers BEGIN
 # This should only be used by createUserProfile since we may not have a UUID
 # yet. All others should use the UUID.
-def verifyUserToken(token):
-    try:
-        # attempt to validate token on the client-side
-        logging.debug("Using OAuth2Client to verify id token of length %d from android phones" % len(token))
-        tokenFields = oauth2client.client.verify_id_token(token,client_key)
-        logging.debug(tokenFields)
-    except AppIdentityError as androidExp:
-        try:
-            logging.debug("Using OAuth2Client to verify id token of length %d from android phones using old token" % len(token))
-            tokenFields = oauth2client.client.verify_id_token(token,client_key_old)
-            logging.debug(tokenFields)
-        except AppIdentityError as androidExpOld:
-            try:
-                logging.debug("Using OAuth2Client to verify id token from iOS phones")
-                tokenFields = oauth2client.client.verify_id_token(token, ios_client_key)
-                logging.debug(tokenFields)
-            except AppIdentityError as iOSExp:
-                try:
-                    logging.debug("Using OAuth2Client to verify id token from newer iOS phones")
-                    tokenFields = oauth2client.client.verify_id_token(token, ios_client_key_new)
-                    logging.debug(tokenFields)
-                except AppIdentityError as iOSExp:
-                    traceback.print_exc()
-                    logging.debug("OAuth failed to verify id token, falling back to constructedURL")
-                    #fallback to verifying using Google API
-                    constructedURL = ("https://www.googleapis.com/oauth2/v1/tokeninfo?id_token=%s" % token)
-                    r = requests.get(constructedURL)
-                    tokenFields = json.loads(r.content)
-                    in_client_key = tokenFields['audience']
-                    if (in_client_key != client_key):
-                        if (in_client_key != ios_client_key and 
-                            in_client_key != ios_client_key_new):
-                            abort(401, "Invalid client key %s" % in_client_key)
-    logging.debug("Found user email %s" % tokenFields['email'])
-    return tokenFields['email']
-
-def getUUIDFromToken(token):
-    userEmail = verifyUserToken(token)
-    return __getUUIDFromEmail__(userEmail)
-
-# This should not be used for general API calls
-def __getUUIDFromEmail__(userEmail):
-    user=User.fromEmail(userEmail)
-    if user is None:
-        return None
-    user_uuid=user.uuid
-    return user_uuid
-
-def __getToken__(request, inHeader):
-    if inHeader:
-      userHeaderSplitList = request.headers.get('User').split()
-      if len(userHeaderSplitList) == 1:
-          userToken = userHeaderSplitList[0]
-      else:
-          userToken = userHeaderSplitList[1]
-    else:
-      userToken = request.json['user']
-
-    return userToken
 
 def getUUID(request, inHeader=False):
-  retUUID = None
-  if skipAuth:
-    if 'User' in request.headers or 'user' in request.json:
-        # skipAuth = true, so the email will be sent in plaintext
-        userEmail = __getToken__(request, inHeader)
-        retUUID = __getUUIDFromEmail__(userEmail)
-        logging.debug("skipAuth = %s, returning UUID directly from email %s" % (skipAuth, retUUID))
-    else:
-        logging.debug("skipAuth = %s, returning None")
-        return None
-    if Client("choice").getClientKey() is None:
-        Client("choice").update(createKey = True)
-  else:
-    userToken = __getToken__(request, inHeader)
-    retUUID = getUUIDFromToken(userToken)
-  if retUUID is None:
-     raise HTTPError(403, "token is valid, but no account found for user")
-  request.params.user_uuid = retUUID
-  return retUUID
+    try:
+        retUUID = enaa.getUUID(request, auth_method, inHeader)
+        logging.debug("retUUID = %s" % retUUID)
+        if retUUID is None:
+           raise HTTPError(403, "token is valid, but no account found for user")
+        return retUUID
+    except ValueError, e:
+        traceback.print_exc()
+        abort(401, e.message)
+
 # Auth helpers END
 
 if __name__ == '__main__':
@@ -809,18 +734,16 @@ if __name__ == '__main__':
     # port number
     if server_port == "443":
       # We support SSL and want to use it
+      key_file = open('conf/net/keys.json')
+      key_data = json.load(key_file)
+      ssl_cert = key_data["ssl_certificate"]
+      private_key = key_data["private_key"]
+
       run(host=server_host, port=server_port, server='cherrypy', debug=True,
           certfile=ssl_cert, keyfile=private_key, ssl_module='builtin')
     else:
       # Non SSL option for testing on localhost
-      # We can theoretically use a separate skipAuth flag specified in the config file,
-      # but then we have to define the behavior if SSL is true and we are not
-      # running on localhost but still want to run without authentication. That is
-      # not really an important use case now, and it makes people have to change
-      # two values and increases the chance of bugs. So let's key the auth skipping from this as well.
-      skipAuth = True
-      print "Running with HTTPS turned OFF, skipAuth = True"
-
+      print "Running with HTTPS turned OFF - use a reverse proxy on production"
       run(host=server_host, port=server_port, server='cherrypy', debug=True)
 
     # run(host="0.0.0.0", port=server_port, server='cherrypy', debug=True)
