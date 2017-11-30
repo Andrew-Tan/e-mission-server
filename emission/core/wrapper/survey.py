@@ -6,8 +6,8 @@ class Survey(ecwb.WrapperBase):
     props = {
         "local_dt": ecwb.WrapperBase.Access.RO,  # searchable datetime in local time
         "fmt_time": ecwb.WrapperBase.Access.RO,  # formatted time
-        "trip_start_ts": ecwb.WrapperBase.Access.RO,  # time stamp of associate trip
-        "trip_end_ts": ecwb.WrapperBase.Access.RO,  # time stamp of associate trip
+        "start_ts": ecwb.WrapperBase.Access.RO,  # time stamp of associate trip
+        "end_ts": ecwb.WrapperBase.Access.RO,  # time stamp of associate trip
         "survey": ecwb.WrapperBase.Access.RO,  # survey data
     }
 
